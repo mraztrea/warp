@@ -7,6 +7,7 @@ This file provides guidance when working with code in this repository.
 ### Build and Run
 - `cargo run` - Build and run Warp locally
 - `cargo bundle --bin warp` - Bundle the main app
+- On Windows, prefer `./script/windows/bundle.ps1 -CHANNEL oss -SKIP_BUILD_INSTALLER` for a direct executable build, or see `BUILD_WINDOWS.md` for the full Windows flow
 
 ### Running with local warp-server
 To connect Warp client to a local warp-server instance:

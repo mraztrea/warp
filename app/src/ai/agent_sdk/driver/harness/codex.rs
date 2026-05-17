@@ -15,13 +15,14 @@ use warp_cli::agent::Harness;
 use warpui::{ModelHandle, ModelSpawner, SingletonEntity};
 
 use crate::ai::agent::conversation::AIConversationId;
-use crate::ai::ambient_agents::AmbientAgentTaskId;
+use crate::ai::ambient_agents::{task::HarnessModelConfig, AmbientAgentTaskId};
 use crate::ai::mcp::JSONTransportType;
 use crate::server::server_api::harness_support::{upload_to_target, HarnessSupportClient};
 use crate::server::server_api::ServerApi;
 use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::terminal::model::block::BlockId;
 use crate::terminal::CLIAgent;
+use warp_managed_secrets::ManagedSecretValue;
 
 use super::super::terminal::{CommandHandle, TerminalDriver};
 use super::super::{AgentDriver, AgentDriverError};
@@ -87,16 +88,18 @@ impl ThirdPartyHarness for CodexHarness {
         terminal_driver: ModelHandle<TerminalDriver>,
         resume: Option<ResumePayload>,
         resolved_env_vars: &HashMap<OsString, OsString>,
+        resolved_secrets: &HashMap<String, ManagedSecretValue>,
         resolved_mcp_servers: &HashMap<String, JSONMCPServer>,
-        third_party_harness_model_id: Option<&str>,
+        third_party_harness_model_config: Option<&HarnessModelConfig>,
     ) -> Result<Box<dyn HarnessRunner>, AgentDriverError> {
         // Prepare the environment config files.
         prepare_codex_environment_config(
             working_dir,
             system_prompt,
             resolved_env_vars,
+            resolved_secrets,
             resolved_mcp_servers,
-            third_party_harness_model_id,
+            third_party_harness_model_config,
         )
         .map_err(|error| AgentDriverError::HarnessConfigSetupFailed {
             harness: self.cli_agent().command_prefix().to_owned(),
@@ -436,6 +439,7 @@ async fn upload_transcript(
 }
 
 const CODEX_CONFIG_DIR: &str = ".codex";
+const CODEX_HOME_ENV: &str = "CODEX_HOME";
 const CODEX_AGENTS_OVERRIDE_FILE_NAME: &str = "AGENTS.override.md";
 const CODEX_AUTH_FILE_NAME: &str = "auth.json";
 const CODEX_CONFIG_TOML_FILE_NAME: &str = "config.toml";
@@ -447,7 +451,9 @@ const CODEX_TRUST_LEVEL_TRUSTED: &str = "trusted";
 /// Top-level config key codex reads to override the built-in `openai` provider's base URL
 /// (codex `core/src/config/mod.rs`).
 const CODEX_OPENAI_BASE_URL_KEY: &str = "openai_base_url";
+const CODEX_CHECK_FOR_UPDATE_ON_STARTUP_KEY: &str = "check_for_update_on_startup";
 const CODEX_MODEL_KEY: &str = "model";
+const CODEX_MODEL_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
 /// Target model for the `[notice.model_migrations]` table that suppresses Codex's
 /// "choose a newer model" upgrade prompt at session launch. We stamp this for any
 /// pinned model id (even when it already matches the target) so the unattended
@@ -456,21 +462,15 @@ const CODEX_MODEL_KEY: &str = "model";
 /// TODO: Ideally, we would make this server-driven so we don't depend on a client
 /// release to change this.
 const CODEX_MODEL_MIGRATIONS_TARGET: &str = "gpt-5.4";
-/// US data-residency endpoint. Our OpenAI keys are issued under a US-residency project,
-/// which rejects requests to the global host with `401 incorrect_hostname`.
-/// TODO(REMOTE-1509): plumb a region-tagged auth secret instead of hardcoding the URL.
-const CODEX_OPENAI_BASE_URL: &str = "https://us.api.openai.com/v1";
-
 fn prepare_codex_environment_config(
     working_dir: &Path,
     system_prompt: Option<&str>,
     resolved_env_vars: &HashMap<OsString, OsString>,
+    resolved_secrets: &HashMap<String, ManagedSecretValue>,
     resolved_mcp_servers: &HashMap<String, JSONMCPServer>,
-    third_party_harness_model_id: Option<&str>,
+    third_party_harness_model_config: Option<&HarnessModelConfig>,
 ) -> Result<()> {
-    let home_dir =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?;
-    let codex_dir = home_dir.join(CODEX_CONFIG_DIR);
+    let codex_dir = codex_config_dir()?;
 
     if let Some(prompt) = system_prompt {
         write_codex_agents_override(&codex_dir, prompt)?;
@@ -481,13 +481,30 @@ fn prepare_codex_environment_config(
         None => log::info!("No OPENAI_API_KEY available; skipping Codex auth.json seed"),
     }
 
+    // Resolve the base URL directly from the typed OpenAI secret. This avoids
+    // leaking base_url into the child process environment and ensures we only
+    // apply it when the typed secret is the active API key source.
+    let openai_base_url = resolve_openai_base_url_from_secret(resolved_secrets, resolved_env_vars);
+
     prepare_codex_config_toml(
         &codex_dir.join(CODEX_CONFIG_TOML_FILE_NAME),
         working_dir,
         resolved_mcp_servers,
-        third_party_harness_model_id,
+        third_party_harness_model_config,
+        openai_base_url.as_deref(),
     )?;
     Ok(())
+}
+
+fn codex_config_dir() -> Result<PathBuf> {
+    if let Ok(dir) = std::env::var(CODEX_HOME_ENV) {
+        if !dir.is_empty() {
+            return Ok(PathBuf::from(dir));
+        }
+    }
+    dirs::home_dir()
+        .map(|home| home.join(CODEX_CONFIG_DIR))
+        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))
 }
 
 fn write_codex_agents_override(codex_dir: &Path, system_prompt: &str) -> Result<()> {
@@ -588,20 +605,55 @@ fn resolve_openai_api_key(resolved_env_vars: &HashMap<OsString, OsString>) -> Op
         .filter(|s| !s.is_empty())
 }
 
+/// Returns the OpenAI base URL from the typed secret, if applicable.
+///
+/// The base URL is only used when the typed `OpenaiApiKey` secret is the active
+/// source of `OPENAI_API_KEY`. If a worker-injected process env already provides
+/// the API key, the typed-secret base URL is not applied (the worker controls
+/// both the key and endpoint).
+fn resolve_openai_base_url_from_secret(
+    secrets: &HashMap<String, ManagedSecretValue>,
+    resolved_env_vars: &HashMap<OsString, OsString>,
+) -> Option<String> {
+    // If the worker already injected an API key, the typed secret lost
+    // precedence — do not apply its base URL.
+    if std::env::var(OPENAI_API_KEY_ENV)
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        return None;
+    }
+
+    // Only apply when the resolved env vars actually contain OPENAI_API_KEY
+    // from the typed secret (i.e. the secret was not skipped).
+    resolved_env_vars.get(OsStr::new(OPENAI_API_KEY_ENV))?;
+
+    secrets.values().find_map(|secret| match secret {
+        ManagedSecretValue::OpenaiApiKey { base_url, .. } => base_url
+            .as_ref()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty()),
+        _ => None,
+    })
+}
+
 /// Edit `~/.codex/config.toml` via `toml_edit` to seed the harness defaults
 /// while preserving anything that might already exist there. We handle:
 /// - project trust: for a working dir and all of its git repo subdirectories,
 ///   set the projects to `trusted`.
-/// - base URL: set `openai_base_url = "<US data-residency endpoint>"` so we
-///   hit the regional host our API keys require.
-/// - model override: when a non-default `third_party_harness_model_id` is
+/// - base URL: when `openai_base_url` is provided (from the secret's `base_url`
+///   field), write it to config.toml. When absent, skip the key entirely so
+///   Codex uses the provider's default global endpoint.
+/// - update checks: disable Codex's startup update prompt for unattended runs.
+/// - model override: when a non-default harness model config is
 ///   supplied, write the top-level `model` key so Codex pins the chosen model
 ///   for new sessions.
 fn prepare_codex_config_toml(
     config_toml_path: &Path,
     working_dir: &Path,
     resolved_mcp_servers: &HashMap<String, JSONMCPServer>,
-    third_party_harness_model_id: Option<&str>,
+    third_party_harness_model_config: Option<&HarnessModelConfig>,
+    openai_base_url: Option<&str>,
 ) -> Result<()> {
     let existing = match fs::read_to_string(config_toml_path) {
         Ok(content) => content,
@@ -620,8 +672,13 @@ fn prepare_codex_config_toml(
         )
     })?;
 
-    set_codex_openai_base_url(&mut doc, CODEX_OPENAI_BASE_URL);
-    set_codex_model(&mut doc, third_party_harness_model_id);
+    // Only write openai_base_url when the secret specifies one.
+    if let Some(url) = openai_base_url {
+        set_codex_openai_base_url(&mut doc, url);
+    }
+    set_codex_check_for_update_on_startup(&mut doc, false);
+    set_codex_model(&mut doc, third_party_harness_model_config);
+    set_codex_model_reasoning_effort(&mut doc, third_party_harness_model_config);
 
     let canonical = working_dir.canonicalize().with_context(|| {
         format!(
@@ -660,10 +717,35 @@ fn set_codex_openai_base_url(doc: &mut toml_edit::DocumentMut, base_url: &str) {
     doc[CODEX_OPENAI_BASE_URL_KEY] = toml_edit::value(base_url);
 }
 
-fn set_codex_model(doc: &mut toml_edit::DocumentMut, third_party_harness_model_id: Option<&str>) {
-    let Some(model_id) =
-        third_party_harness_model_id.filter(|id| !id.is_empty() && *id != "default")
+fn set_codex_check_for_update_on_startup(doc: &mut toml_edit::DocumentMut, enabled: bool) {
+    doc[CODEX_CHECK_FOR_UPDATE_ON_STARTUP_KEY] = toml_edit::value(enabled);
+}
+
+fn set_codex_model_reasoning_effort(
+    doc: &mut toml_edit::DocumentMut,
+    third_party_harness_model_config: Option<&HarnessModelConfig>,
+) {
+    let Some(reasoning_level) = third_party_harness_model_config
+        .and_then(|config| config.reasoning_level.as_deref())
+        .filter(|level| !level.is_empty())
     else {
+        doc.remove(CODEX_MODEL_REASONING_EFFORT_KEY);
+        return;
+    };
+    doc[CODEX_MODEL_REASONING_EFFORT_KEY] = toml_edit::value(reasoning_level);
+}
+
+fn set_codex_model(
+    doc: &mut toml_edit::DocumentMut,
+    third_party_harness_model_config: Option<&HarnessModelConfig>,
+) {
+    let Some(model_id) = third_party_harness_model_config
+        .map(|config| config.model_id.as_str())
+        .filter(|id| !id.is_empty() && *id != "default")
+    else {
+        // No model specified or "default" selected — remove any pre-existing
+        // key so Codex uses its own default.
+        doc.remove(CODEX_MODEL_KEY);
         return;
     };
     doc[CODEX_MODEL_KEY] = toml_edit::value(model_id);

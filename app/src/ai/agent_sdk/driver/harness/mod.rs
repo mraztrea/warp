@@ -13,7 +13,7 @@ use warp_cli::agent::Harness;
 use warpui::{ModelHandle, ModelSpawner, SingletonEntity};
 
 use crate::ai::agent::conversation::AIConversationId;
-use crate::ai::ambient_agents::AmbientAgentTaskId;
+use crate::ai::ambient_agents::{task::HarnessModelConfig, AmbientAgentTaskId};
 use crate::ai::mcp::JSONMCPServer;
 use crate::server::server_api::harness_support::{upload_to_target, HarnessSupportClient};
 use crate::server::server_api::ServerApi;
@@ -26,6 +26,7 @@ use warp_cli::{
     SESSION_SHARING_SERVER_URL_OVERRIDE_ENV, WS_SERVER_URL_OVERRIDE_ENV,
 };
 use warp_core::channel::ChannelState;
+use warp_managed_secrets::ManagedSecretValue;
 
 use super::terminal::{CommandHandle, TerminalDriver};
 use super::{
@@ -164,6 +165,9 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
     /// `resolved_env_vars` contains already-resolved secret env vars (worker
     /// env > typed secrets > raw values precedence already applied).
     ///
+    /// `resolved_secrets` provides the raw typed managed secrets so harnesses
+    /// can read structured fields (e.g. `base_url`) without relying on env vars.
+    ///
     /// If `resume` is `Some`, the harness matches on its own [`ResumePayload`]
     /// variant and reuses stored session/conversation ids.
     #[allow(clippy::too_many_arguments)]
@@ -179,8 +183,9 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
         terminal_driver: ModelHandle<TerminalDriver>,
         resume: Option<ResumePayload>,
         resolved_env_vars: &HashMap<OsString, OsString>,
+        resolved_secrets: &HashMap<String, ManagedSecretValue>,
         resolved_mcp_servers: &HashMap<String, JSONMCPServer>,
-        third_party_harness_model_id: Option<&str>,
+        third_party_harness_model_config: Option<&HarnessModelConfig>,
     ) -> Result<Box<dyn HarnessRunner>, AgentDriverError>;
 }
 
@@ -374,10 +379,13 @@ pub(crate) fn task_env_vars(
 /// Claude Code's `settings.json`.
 pub(crate) fn harness_model_env_vars(
     selected_harness: Harness,
-    third_party_harness_model_id: Option<&str>,
+    third_party_harness_model_config: Option<&HarnessModelConfig>,
 ) -> HashMap<OsString, OsString> {
     let mut env_vars = HashMap::new();
-    let Some(model_id) = third_party_harness_model_id.filter(|id| !id.is_empty()) else {
+    let Some(model_id) = third_party_harness_model_config
+        .map(|config| config.model_id.as_str())
+        .filter(|id| !id.is_empty())
+    else {
         return env_vars;
     };
 

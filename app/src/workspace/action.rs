@@ -164,7 +164,6 @@ pub enum WorkspaceAction {
     ToggleTabConfigsMenu,
     ToggleNewSessionMenu {
         position: Vector2F,
-        is_vertical_tabs: bool,
     },
     SelectNewSessionMenuItem(NewSessionMenuItem),
     AutoupdateFailureLink,
@@ -495,8 +494,13 @@ pub enum WorkspaceAction {
         launch: Option<crate::ai::blocklist::handoff::PendingCloudLaunch>,
         #[cfg(not(all(feature = "local_fs", not(target_family = "wasm"))))]
         launch: Option<()>,
-        explicit_environment_id: Option<crate::server::ids::SyncId>,
+        environment_id: Option<crate::server::ids::SyncId>,
+        entry_point: crate::ai::ambient_agents::telemetry::HandoffEntryPoint,
     },
+    /// Show the environment creation modal during `&` handoff compose when no
+    /// environments exist.
+    ShowHandoffEnvironmentCreationModal,
+    ShowCloudModeV2EnvironmentCreationModal,
     /// Summarize the active AI conversation in the focused pane.
     SummarizeAIConversation {
         prompt: Option<String>,
@@ -570,6 +574,12 @@ pub enum WorkspaceAction {
     /// Reset the OpenWarp launch modal dismissed state (for debugging)
     #[cfg(debug_assertions)]
     ResetOpenWarpLaunchModalState,
+    /// Open the Orchestration Launch Modal (for debugging)
+    #[cfg(debug_assertions)]
+    OpenOrchestrationLaunchModal,
+    /// Reset the orchestration launch modal dismissed state (for debugging)
+    #[cfg(debug_assertions)]
+    ResetOrchestrationLaunchModalState,
     /// Install the opencode-warp plugin from GitHub into the global opencode config.
     #[cfg(debug_assertions)]
     InstallOpenCodeWarpPlugin,
@@ -603,9 +613,8 @@ pub enum WorkspaceAction {
         conversation_id: AIConversationId,
         terminal_view_id: Option<EntityId>,
     },
-    /// Open an ambient agent session by joining its shared session.
-    /// Used when the sandbox is running or when we need to view a live session.
-    OpenAmbientAgentSession {
+    /// Open the canonical ambient agent conversation pane and attach it to a live session.
+    OpenOrAttachAmbientAgentConversation {
         session_id: SessionId,
         task_id: AmbientAgentTaskId,
     },
@@ -933,7 +942,7 @@ impl WorkspaceAction {
             | ShowRewindConfirmationDialog { .. }
             | ExecuteRewindAIConversation { .. }
             | ExecuteDeleteConversation { .. }
-            | OpenAmbientAgentSession { .. }
+            | OpenOrAttachAmbientAgentConversation { .. }
             | OpenConversationTranscriptViewer { .. }
             | OpenLightbox { .. }
             | UpdateLightboxImage { .. }
@@ -949,6 +958,8 @@ impl WorkspaceAction {
             | OpenSettingsFile
             | FixSettingsWithOz { .. }
             | OpenLocalToCloudHandoffPane { .. }
+            | ShowHandoffEnvironmentCreationModal
+            | ShowCloudModeV2EnvironmentCreationModal
             | OpenNetworkLogPane => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,
@@ -962,6 +973,8 @@ impl WorkspaceAction {
             | ResetOzLaunchModalState
             | OpenOpenWarpLaunchModal
             | ResetOpenWarpLaunchModalState
+            | OpenOrchestrationLaunchModal
+            | ResetOrchestrationLaunchModalState
             | InstallOpenCodeWarpPlugin
             | UseLocalOpenCodeWarpPlugin => false,
             #[cfg(not(target_family = "wasm"))]

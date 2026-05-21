@@ -83,6 +83,8 @@ impl ServerOutputId {
 pub enum CancellationReason {
     /// The user explicitly cancelled without providing a follow-up.
     ManuallyCancelled,
+    /// Warp automatically cancelled the local run so it could continue in Cloud Mode.
+    AutomaticCloudHandoff,
 
     /// The user submitted a follow-up query during streaming which implicitly cancelled the current one.
     FollowUpSubmitted {
@@ -107,6 +109,7 @@ impl Display for CancellationReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CancellationReason::ManuallyCancelled => write!(f, "manual cancellation"),
+            CancellationReason::AutomaticCloudHandoff => write!(f, "automatic cloud handoff"),
             CancellationReason::FollowUpSubmitted { .. } => write!(f, "follow-up submission"),
             CancellationReason::UserCommandExecuted => write!(f, "user command execution"),
             CancellationReason::Reverted => write!(f, "revert"),
@@ -1535,9 +1538,12 @@ pub enum SubagentType {
     Summarization,
     ConversationSearch {
         query: Option<String>,
-        /// The ID of the conversation being searched. None when searching the
-        /// current conversation.
+        /// Search targets are mutually exclusive; at most one of `conversation_id` or
+        /// `agent_run_id` should be populated for a single conversation search subagent.
+        /// The ID of the conversation being searched.
         conversation_id: Option<String>,
+        /// The ID of the agent run being searched.
+        agent_run_id: Option<String>,
     },
     WarpDocumentationSearch,
     Unknown,

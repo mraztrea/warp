@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use crate::remote_server::diff_state_proto::{try_decode_file_delta, try_decode_snapshot};
 use crate::remote_server::proto;
-use crate::util::git::{Commit, PrInfo};
+use crate::util::git::{BranchEntry, Commit, PrInfo};
 use remote_server::manager::{RemoteServerManager, RemoteServerManagerEvent};
 use warp_core::{HostId, SessionId};
 use warp_util::remote_path::RemotePath;
@@ -140,6 +140,24 @@ impl RemoteDiffStateModel {
                 }
                 self.handle_file_delta_received(delta, ctx);
             }
+            RemoteServerManagerEvent::GetBranchesResponse {
+                repo_path, result, ..
+            } if repo_path == &self.remote_path.path => {
+                let branches = match result {
+                    Ok(branch_infos) => branch_infos
+                        .iter()
+                        .map(|info| BranchEntry {
+                            name: info.name.clone(),
+                            is_main: info.is_main,
+                        })
+                        .collect(),
+                    Err(err) => {
+                        log::warn!("RemoteDiffStateModel: GetBranches failed: {err}");
+                        vec![]
+                    }
+                };
+                ctx.emit(DiffStateModelEvent::BranchesReceived(branches));
+            }
             RemoteServerManagerEvent::HostDisconnected { host_id }
                 if host_id == &self.remote_path.host_id =>
             {
@@ -237,6 +255,24 @@ impl RemoteDiffStateModel {
 
     // ── Apply methods ──────────────────────────────────────────────────────
 
+    /// Requests a fresh diff snapshot from the remote server, including file
+    /// content. Unlike the former `replay_latest_diffs` (which reconstructed
+    /// data from cached `GitDiffData` and lost `content_at_head`), this sends
+    /// an actual `GetDiffState` RPC so the server can reload content from disk.
+    ///
+    /// Does NOT transition to `Loading` or emit `NewDiffsComputed(None)` first,
+    /// so existing views subscribed to this model won't flash a loading state.
+    /// The server response arrives as a `DiffStateSnapshotReceived` event and
+    /// flows through `apply_snapshot` normally.
+    pub(crate) fn fetch_fresh_snapshot(&self, ctx: &mut ModelContext<Self>) {
+        let remote_path = self.remote_path.clone();
+        let mode = self.mode.clone();
+        let session_id = self.session_id;
+        RemoteServerManager::handle(ctx).update(ctx, |mgr, ctx| {
+            mgr.get_diff_state(session_id, remote_path, proto::DiffMode::from(&mode), ctx);
+        });
+    }
+
     fn apply_snapshot(
         &mut self,
         metadata: Option<DiffMetadata>,
@@ -302,7 +338,7 @@ impl RemoteDiffStateModel {
 
     fn apply_file_delta(
         &mut self,
-        file_path: StandardizedPath,
+        file_path: String,
         diff: Option<FileDiffAndContent>,
         metadata: Option<DiffMetadata>,
         ctx: &mut ModelContext<Self>,
@@ -316,22 +352,20 @@ impl RemoteDiffStateModel {
             return;
         };
 
-        let event_path = file_path.to_local_path_lossy();
-
         if let Some(ref new_diff) = diff {
-            if let Some(pos) = diffs.files.iter().position(|f| f.file_path == event_path) {
+            if let Some(pos) = diffs.files.iter().position(|f| f.file_path == file_path) {
                 diffs.files[pos] = new_diff.file_diff.clone();
             } else {
                 diffs.files.push(new_diff.file_diff.clone());
             }
         } else {
-            diffs.files.retain(|f| f.file_path != event_path);
+            diffs.files.retain(|f| f.file_path != file_path);
         }
         diffs.total_additions = diffs.files.iter().map(|f| f.additions()).sum();
         diffs.total_deletions = diffs.files.iter().map(|f| f.deletions()).sum();
         diffs.files_changed = diffs.files.len();
         ctx.emit(DiffStateModelEvent::SingleFileUpdated {
-            path: event_path,
+            path: file_path,
             diff: diff.map(Arc::new),
         });
     }
@@ -458,6 +492,17 @@ impl RemoteDiffStateModel {
         self.unsubscribe(ctx);
         self.mode = mode;
         self.resubscribe(ctx);
+    }
+
+    /// Fetches branches for the remote repository via the `GetBranches` RPC.
+    /// The response is handled in `handle_manager_event` which emits
+    /// `DiffStateModelEvent::BranchesReceived`.
+    pub fn fetch_branches(&self, ctx: &mut ModelContext<Self>) {
+        let session_id = self.session_id;
+        let remote_path = self.remote_path.clone();
+        RemoteServerManager::handle(ctx).update(ctx, |mgr, ctx| {
+            mgr.get_branches(session_id, remote_path, None, false, ctx);
+        });
     }
 
     /// Sends a `DiscardFiles` request to the remote server.

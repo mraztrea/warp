@@ -95,6 +95,12 @@ impl VerticalTabsPaneContextMenuTarget {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoCloudHandoffTrigger {
+    MacOsSleep,
+    Uri,
+}
+
 #[derive(Debug, Clone)]
 pub enum WorkspaceAction {
     ActivateTab(usize),
@@ -497,10 +503,22 @@ pub enum WorkspaceAction {
         environment_id: Option<crate::server::ids::SyncId>,
         entry_point: crate::ai::ambient_agents::telemetry::HandoffEntryPoint,
     },
+    /// Automatically hand off the active running local agent conversation in the
+    /// given terminal view to Cloud Mode.
+    AutoHandoffActiveAgentToCloud {
+        terminal_view_id: EntityId,
+        conversation_id: AIConversationId,
+        trigger: AutoCloudHandoffTrigger,
+    },
     /// Show the environment creation modal during `&` handoff compose when no
     /// environments exist.
     ShowHandoffEnvironmentCreationModal,
     ShowCloudModeV2EnvironmentCreationModal,
+    /// Open the workspace modal for creating a new managed auth secret.
+    /// Dispatched by orchestration card pickers' "New API key…" item.
+    OpenCreateAuthSecretModal {
+        harness: warp_cli::agent::Harness,
+    },
     /// Summarize the active AI conversation in the focused pane.
     SummarizeAIConversation {
         prompt: Option<String>,
@@ -958,8 +976,10 @@ impl WorkspaceAction {
             | OpenSettingsFile
             | FixSettingsWithOz { .. }
             | OpenLocalToCloudHandoffPane { .. }
+            | AutoHandoffActiveAgentToCloud { .. }
             | ShowHandoffEnvironmentCreationModal
             | ShowCloudModeV2EnvironmentCreationModal
+            | OpenCreateAuthSecretModal { .. }
             | OpenNetworkLogPane => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,

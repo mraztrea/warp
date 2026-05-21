@@ -21,6 +21,7 @@ use crate::auth::auth_manager::AuthManager;
 use crate::auth::auth_view_modal::AuthViewVariant;
 use crate::auth::AuthStateProvider;
 use crate::cloud_object::Space;
+use crate::code::buffer_location::LocalOrRemotePath;
 #[cfg(feature = "local_fs")]
 use crate::code::editor_management::CodeSource;
 use crate::code::view::CodeViewAction;
@@ -290,6 +291,7 @@ pub enum PaneGroupAction {
     Activate(PaneId, ActivationReason),
     ResizeMove(Vector2F),
     StartResizing(DraggedBorder),
+    ResetPaneSizes(EntityId),
     Move {
         id: PaneId,
         target_pane_id: PaneId,
@@ -729,7 +731,7 @@ pub enum Event {
         path: PathBuf,
     },
     InsertCodeReviewComments {
-        repo_path: PathBuf,
+        repo_path: LocalOrRemotePath,
         comments: Vec<PendingImportedReviewComment>,
         diff_mode: DiffMode,
         open_code_review: Option<CodeReviewPanelArg>,
@@ -3223,15 +3225,24 @@ impl PaneGroup {
             return true;
         }
 
-        let parent_conversation_id = BlocklistAIHistoryModel::as_ref(ctx)
-            .conversation(&child_conversation_id)
-            .and_then(|conversation| conversation.parent_conversation_id())
-            .or_else(|| {
-                RestoredAgentConversations::handle(ctx).read(ctx, |store, _| {
-                    store
-                        .get_conversation(&child_conversation_id)
-                        .and_then(|conversation| conversation.parent_conversation_id())
-                })
+        let parent_conversation_id =
+            BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, ctx| {
+                history_model
+                    .conversation(&child_conversation_id)
+                    .and_then(|conversation| {
+                        history_model.resolved_parent_conversation_id_for_conversation(conversation)
+                    })
+                    .or_else(|| {
+                        RestoredAgentConversations::handle(ctx).read(ctx, |store, _| {
+                            store.get_conversation(&child_conversation_id).and_then(
+                                |conversation| {
+                                    history_model.resolved_parent_conversation_id_for_conversation(
+                                        conversation,
+                                    )
+                                },
+                            )
+                        })
+                    })
             });
 
         let Some(parent_conversation_id) = parent_conversation_id else {
@@ -3393,8 +3404,15 @@ impl PaneGroup {
                         .or_else(|| child_conversation.initial_working_directory())
                         .map(PathBuf::from),
                 });
-        let new_pane_id =
-            self.insert_terminal_pane_hidden_for_child_agent(parent_pane_id, HashMap::new(), ctx);
+        // Restored hidden child panes don't inherit the host's shared
+        // session — the host's share decision is handled at original
+        // dispatch time, not on subsequent restores.
+        let new_pane_id = self.insert_terminal_pane_hidden_for_child_agent(
+            parent_pane_id,
+            HashMap::new(),
+            IsSharedSessionCreator::No,
+            ctx,
+        );
 
         if let Some(new_terminal_view) = self.terminal_view_from_pane_id(new_pane_id, ctx) {
             if let Some(task_context) = child_task_context.as_ref() {
@@ -4403,14 +4421,21 @@ impl PaneGroup {
         &mut self,
         base_pane_id: PaneId,
         env_vars: HashMap<OsString, OsString>,
+        is_shared_session_creator: IsSharedSessionCreator,
         ctx: &mut ViewContext<Self>,
     ) -> TerminalPaneId {
         let base_session_id = base_pane_id
             .as_terminal_pane_id()
             .or(self.active_session_id(ctx));
         let startup_directory = self.startup_path_for_new_session(base_session_id, ctx);
-        let (pane_data, _view) =
-            self.create_terminal_pane_data(startup_directory, env_vars, None, None, ctx);
+        let (pane_data, _view) = self.create_terminal_pane_data(
+            startup_directory,
+            env_vars,
+            is_shared_session_creator,
+            None,
+            None,
+            ctx,
+        );
         let new_pane_id = pane_data.terminal_pane_id();
         self.attach_child_pane_off_tree(Box::new(pane_data), ctx);
         new_pane_id
@@ -5640,6 +5665,16 @@ impl PaneGroup {
         task_id: AmbientAgentTaskId,
         ctx: &mut ViewContext<Self>,
     ) {
+        // URL-loaded conversation transcripts (e.g. Warp-on-Web deep links)
+        // restore from conversation data before the ambient task cache is
+        // guaranteed to contain this task. Native continuation usually reaches
+        // this path after task-backed navigation, but the restored cloud-mode
+        // pane still needs task ownership/harness data to resolve the correct
+        // inline follow-up or tombstone CTA. Request the task and let
+        // TerminalView's TasksUpdated subscription re-resolve once it arrives.
+        AgentConversationsModel::handle(ctx).update(ctx, |model, ctx| {
+            model.get_or_async_fetch_task_data(&task_id, ctx);
+        });
         let mut conversation_id = None;
         terminal_view.update(ctx, |view, ctx| {
             // The cloud-mode terminal model starts with
@@ -6130,6 +6165,15 @@ impl PaneGroup {
         // Clear hidden closed panes since resizing invalidates undo functionality
         self.clear_hidden_closed_panes(ctx);
         self.dragged_border = Some(info);
+    }
+
+    pub fn reset_pane_sizes(&mut self, border_id: EntityId, ctx: &mut ViewContext<Self>) {
+        self.dragged_border = None;
+        if self.panes.reset_pane_sizes(border_id) {
+            self.clear_hidden_closed_panes(ctx);
+            ctx.notify();
+            ctx.emit(Event::AppStateChanged);
+        }
     }
 
     pub fn end_resizing(&mut self, ctx: &mut ViewContext<Self>) {
@@ -6638,10 +6682,12 @@ impl PaneGroup {
     /// Creates a new terminal session and wraps it in a `TerminalPane`.
     /// This is the shared session-creation boilerplate used by both
     /// `add_session_in_directory` and `insert_terminal_pane_hidden_for_child_agent`.
+    #[allow(clippy::too_many_arguments)]
     fn create_terminal_pane_data(
         &self,
         startup_directory: Option<PathBuf>,
         env_vars: HashMap<OsString, OsString>,
+        is_shared_session_creator: IsSharedSessionCreator,
         chosen_shell: Option<AvailableShell>,
         conversation_restoration: Option<ConversationRestorationInNewPaneType>,
         ctx: &mut ViewContext<Self>,
@@ -6657,7 +6703,7 @@ impl PaneGroup {
         let (view, terminal_manager) = PaneGroup::create_session(
             startup_directory,
             env_vars,
-            IsSharedSessionCreator::No,
+            is_shared_session_creator,
             resources,
             None,
             conversation_restoration,
@@ -6701,6 +6747,7 @@ impl PaneGroup {
         let (pane_data, view) = self.create_terminal_pane_data(
             startup_directory,
             HashMap::new(),
+            IsSharedSessionCreator::No,
             chosen_shell,
             conversation_restoration,
             ctx,
@@ -7829,6 +7876,17 @@ impl PaneGroup {
             .collect()
     }
 
+    /// Returns terminal views from layout-tree-visible panes only.
+    /// Unlike `terminal_views()`, this excludes off-tree child agent panes
+    /// and panes hidden for any reason (temporary replacement, child agent, etc.).
+    pub fn visible_terminal_views(&self, ctx: &AppContext) -> Vec<ViewHandle<TerminalView>> {
+        self.panes
+            .visible_pane_ids()
+            .into_iter()
+            .filter_map(|pane_id| self.terminal_view_from_pane_id(pane_id, ctx))
+            .collect()
+    }
+
     pub fn code_views(&self, ctx: &AppContext) -> Vec<ViewHandle<CodeView>> {
         self.panes_of::<CodePane>()
             .map(|p| p.file_view(ctx))
@@ -7852,10 +7910,10 @@ impl PaneGroup {
     pub fn terminal_view_working_directories<'a>(
         &'a self,
         ctx: &'a AppContext,
-    ) -> impl Iterator<Item = (EntityId, Option<String>)> + 'a {
+    ) -> impl Iterator<Item = (EntityId, Option<LocalOrRemotePath>)> + 'a {
         self.terminal_views(ctx).into_iter().map(|terminal_view| {
             let terminal_id = terminal_view.id();
-            let cwd = terminal_view.as_ref(ctx).pwd_if_local(ctx);
+            let cwd = terminal_view.as_ref(ctx).pwd_as_local_or_remote(ctx);
             (terminal_id, cwd)
         })
     }
@@ -8126,6 +8184,7 @@ impl TypedActionView for PaneGroup {
             Activate(view_id, reason) => self.focus_pane_on_mouse_event(*view_id, *reason, ctx),
             ResizeMove(position) => self.maybe_resize_pane(*position, ctx),
             StartResizing(border) => self.start_resizing(*border, ctx),
+            ResetPaneSizes(border_id) => self.reset_pane_sizes(*border_id, ctx),
             EndResizing => self.end_resizing(ctx),
             ResizeLeft => self.resize_left(ctx),
             ResizeRight => self.resize_right(ctx),

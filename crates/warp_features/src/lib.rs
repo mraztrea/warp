@@ -692,9 +692,6 @@ pub enum FeatureFlag {
     /// content changes via auto-reload.
     CodeReviewScrollPreservation,
 
-    /// Enables orchestration mode (multi-agent parallel execution).
-    Orchestration,
-
     /// Enables server-side durable messaging for orchestration (v2).
     /// When enabled, messages and events are stored in Postgres and the client
     /// opens a persistent SSE connection to the server to receive events in
@@ -877,6 +874,9 @@ pub enum FeatureFlag {
 
     /// Replaces the raw harness CLI command with a styled header showing CLI name + status icon.
     HarnessSessionHeader,
+
+    /// Enables the code review view for remote sessions.
+    RemoteCodeReview,
 }
 
 static FLAG_STATES: [AtomicBool; cardinality::<FeatureFlag>()] =
@@ -923,9 +923,7 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::FileGlobV2Warnings,
     FeatureFlag::SummarizationViaMessageReplacement,
     FeatureFlag::LocalComputerUse,
-    FeatureFlag::AgentViewBlockContext,
     FeatureFlag::OzLaunchModal,
-    FeatureFlag::OzChangelogUpdates,
     FeatureFlag::QueueSlashCommand,
     // These are enabled via 100% experiment on prod warp-server,
     // but we need to enable here for dogfood builds.
@@ -937,19 +935,13 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::EditableMarkdownMermaid,
     FeatureFlag::CodeReviewScrollPreservation,
     FeatureFlag::RememberFastForwardState,
-    FeatureFlag::HOANotifications,
     FeatureFlag::GeminiNotifications,
     FeatureFlag::LocalDockerSandbox,
-    FeatureFlag::CloudModeSetupV2,
     #[cfg(not(windows))]
     FeatureFlag::SshRemoteServer,
-    FeatureFlag::CloudModeInputV2,
     FeatureFlag::DragTabsToWindows,
-    FeatureFlag::OrchestrationLaunchModal,
-    FeatureFlag::HandoffCloudCloud,
-    FeatureFlag::SoloUserByok,
-    FeatureFlag::CustomInferenceEndpoints,
     FeatureFlag::RemoteCodebaseIndexing,
+    FeatureFlag::RemoteCodeReview,
 ];
 
 /// Features enabled for feature preview build users (e.g.: Friends of Warp).
@@ -958,7 +950,6 @@ pub const PREVIEW_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::BlocklistMarkdownTableRendering,
     FeatureFlag::MarkdownTables,
     FeatureFlag::GitOperationsInCodeReview,
-    FeatureFlag::GitCredentialRefresh,
 ];
 
 /// Features enabled for all release builds (i.e.: everything but WarpLocal).
